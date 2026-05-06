@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
@@ -21,6 +21,7 @@ app = FastAPI(title="Lattice Index API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origin_regex=r"https?://.*(:5173|:4173)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,6 +35,47 @@ def startup() -> None:
 
 def row_to_dict(row: Any) -> dict:
     return dict(row) if row is not None else {}
+
+
+CSV_IMPORT_COLUMNS = {
+    "isbn13",
+    "title",
+    "series_name",
+    "volume_number",
+    "author",
+    "publisher",
+    "label",
+    "category",
+    "location_name",
+    "location_detail",
+    "ownership_status",
+    "memo",
+}
+
+
+def clean_csv_value(row: dict[str, str | None], key: str) -> str | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def get_or_create_location(db: Any, name: str | None, timestamp: str) -> int | None:
+    if not name:
+        return None
+    location = db.execute("SELECT id FROM locations WHERE name = ?", (name,)).fetchone()
+    if location:
+        db.execute("UPDATE locations SET is_active = 1, updated_at = ? WHERE id = ?", (timestamp, location["id"]))
+        return location["id"]
+    cursor = db.execute(
+        """
+        INSERT INTO locations(name, sort_order, is_active, created_at, updated_at)
+        VALUES (?, 0, 1, ?, ?)
+        """,
+        (name, timestamp, timestamp),
+    )
+    return cursor.lastrowid
 
 
 COPY_SELECT = """
@@ -387,6 +429,126 @@ def export_csv() -> StreamingResponse:
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=lattice-index.csv"},
     )
+
+
+@app.post("/api/import/csv")
+async def import_csv(file: UploadFile = File(...)) -> dict:
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=422, detail="CSVファイルが空です。")
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            text = content.decode("cp932")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=422, detail="CSVはUTF-8またはShift_JISで保存してください。") from exc
+
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise HTTPException(status_code=422, detail="CSVヘッダがありません。")
+    missing = {"title"} - set(reader.fieldnames)
+    if missing:
+        raise HTTPException(status_code=422, detail=f"必須列がありません: {', '.join(sorted(missing))}")
+
+    timestamp = now_iso()
+    imported = 0
+    skipped = 0
+    errors: list[dict[str, Any]] = []
+    with connect() as db:
+        for line_number, row in enumerate(reader, start=2):
+            title = clean_csv_value(row, "title")
+            if not title:
+                skipped += 1
+                errors.append({"line": line_number, "detail": "titleが空です。"})
+                continue
+
+            isbn13 = clean_csv_value(row, "isbn13")
+            isbn10 = None
+            if isbn13:
+                try:
+                    isbn13, isbn10 = normalize_isbn(isbn13)
+                except ISBNError as exc:
+                    skipped += 1
+                    errors.append({"line": line_number, "detail": str(exc)})
+                    continue
+
+            location_id = get_or_create_location(db, clean_csv_value(row, "location_name"), timestamp)
+            ownership_status = clean_csv_value(row, "ownership_status") or "owned"
+            if ownership_status not in {"owned", "disposed", "lost", "sold"}:
+                skipped += 1
+                errors.append({"line": line_number, "detail": f"ownership_statusが不正です: {ownership_status}"})
+                continue
+
+            book = None
+            if isbn13:
+                book = db.execute("SELECT * FROM books WHERE isbn13 = ?", (isbn13,)).fetchone()
+
+            if book:
+                book_id = book["id"]
+            else:
+                normalized = normalize_search_text(
+                    title,
+                    clean_csv_value(row, "series_name"),
+                    clean_csv_value(row, "volume_number"),
+                    clean_csv_value(row, "author"),
+                    clean_csv_value(row, "publisher"),
+                    clean_csv_value(row, "label"),
+                    isbn13,
+                )
+                cursor = db.execute(
+                    """
+                    INSERT INTO books(
+                      isbn13, isbn10, title, series_name, volume_number, author,
+                      publisher, label, category, metadata_source,
+                      normalized_search_text, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'csv', ?, ?, ?)
+                    """,
+                    (
+                        isbn13,
+                        isbn10,
+                        title,
+                        clean_csv_value(row, "series_name"),
+                        clean_csv_value(row, "volume_number"),
+                        clean_csv_value(row, "author"),
+                        clean_csv_value(row, "publisher"),
+                        clean_csv_value(row, "label"),
+                        clean_csv_value(row, "category"),
+                        normalized,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                book_id = cursor.lastrowid
+                sync_book_search(db, book_id)
+
+            db.execute(
+                """
+                INSERT INTO copies(
+                  book_id, ownership_status, location_id, location_detail,
+                  condition, memo, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, 'unknown', ?, ?, ?)
+                """,
+                (
+                    book_id,
+                    ownership_status,
+                    location_id,
+                    clean_csv_value(row, "location_detail"),
+                    clean_csv_value(row, "memo"),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            imported += 1
+
+    return {
+        "imported": imported,
+        "skipped": skipped,
+        "errors": errors[:20],
+        "accepted_columns": sorted(CSV_IMPORT_COLUMNS),
+    }
 
 
 @app.post("/api/backup")

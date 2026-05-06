@@ -1,4 +1,12 @@
-export const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000';
+function defaultApiBase() {
+  if (typeof window === 'undefined') return 'http://localhost:8000';
+  if (['5173', '4173'].includes(window.location.port)) {
+    return `${window.location.protocol}//${window.location.hostname}:8000`;
+  }
+  return window.location.origin;
+}
+
+export const API_BASE = import.meta.env.VITE_API_BASE ?? defaultApiBase();
 
 export type Location = {
   id: number;
@@ -43,6 +51,13 @@ export type LookupResult = {
   raw?: unknown;
 };
 
+export type CsvImportResult = {
+  imported: number;
+  skipped: number;
+  errors: Array<{ line: number; detail: string }>;
+  accepted_columns: string[];
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
@@ -76,5 +91,18 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(body)
   }),
-  updateCopy: (id: number, body: unknown) => request<CopyRow>(`/api/copies/${id}`, { method: 'PATCH', body: JSON.stringify(body) })
+  updateCopy: (id: number, body: unknown) => request<CopyRow>(`/api/copies/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  importCsv: async (file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await fetch(`${API_BASE}/api/import/csv`, {
+      method: 'POST',
+      body: formData
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ detail: response.statusText }));
+      throw new Error(error.detail ?? 'CSV import failed');
+    }
+    return response.json() as Promise<CsvImportResult>;
+  }
 };

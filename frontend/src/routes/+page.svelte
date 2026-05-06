@@ -2,6 +2,7 @@
   import {
     Archive,
     BookOpen,
+    Camera,
     Check,
     Database,
     Download,
@@ -13,12 +14,28 @@
     Search,
     Settings,
     Trash2,
+    Upload,
     X
   } from 'lucide-svelte';
-  import { onMount } from 'svelte';
+  import { BarcodeFormat, DecodeHintType } from '@zxing/library';
+  import { BrowserMultiFormatReader, type IScannerControls } from '@zxing/browser';
+  import { onDestroy, onMount } from 'svelte';
   import { API_BASE, api, type CopyRow, type Location, type LookupResult } from '$lib/api';
 
   type View = 'home' | 'add' | 'settings';
+
+  const emptyForm = {
+    title: '',
+    author: '',
+    series_name: '',
+    volume_number: '',
+    publisher: '',
+    label: '',
+    category: '',
+    location_id: 0,
+    location_detail: '',
+    memo: ''
+  };
 
   let view: View = 'home';
   let copies: CopyRow[] = [];
@@ -32,19 +49,17 @@
   let isbn = '';
   let lookup: LookupResult | null = null;
   let duplicate: { existing_book_id?: number; existing_copies?: CopyRow[]; message?: string } | null = null;
-  let form = {
-    title: '',
-    author: '',
-    series_name: '',
-    volume_number: '',
-    publisher: '',
-    label: '',
-    category: '',
-    location_id: 0,
-    location_detail: '',
-    memo: ''
-  };
+  let form = { ...emptyForm };
   let newLocation = '';
+  let csvFile: File | null = null;
+
+  let videoElement: HTMLVideoElement;
+  let scannerControls: IScannerControls | null = null;
+  let cameraActive = false;
+  let cameraMessage = '';
+  let cameraSupported = false;
+  let cameraSecureContext = false;
+  let scanLocked = false;
 
   $: activeLocations = locations.filter((location) => location.is_active);
 
@@ -73,6 +88,10 @@
   }
 
   async function lookupIsbn() {
+    if (!isbn.trim()) {
+      message = 'ISBNを入力してください。';
+      return;
+    }
     loading = true;
     duplicate = null;
     message = '';
@@ -91,6 +110,58 @@
     } finally {
       loading = false;
     }
+  }
+
+  function normalizeScannedIsbn(value: string) {
+    return value.replace(/[^0-9Xx]/g, '');
+  }
+
+  function createScanner() {
+    const hints = new Map<DecodeHintType, unknown>();
+    hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.EAN_13, BarcodeFormat.EAN_8, BarcodeFormat.UPC_A]);
+    hints.set(DecodeHintType.TRY_HARDER, true);
+    return new BrowserMultiFormatReader(hints, {
+      delayBetweenScanAttempts: 120,
+      delayBetweenScanSuccess: 400
+    });
+  }
+
+  async function startCameraScan() {
+    if (!cameraSupported) {
+      cameraMessage = 'このブラウザではカメラ読み取りを利用できません。';
+      return;
+    }
+    if (!cameraSecureContext) {
+      cameraMessage = 'カメラを使うにはHTTPS、またはlocalhostで開いてください。携帯から使う場合はHTTPS配信が必要です。';
+      return;
+    }
+
+    await stopCameraScan();
+    cameraMessage = '本の裏表紙のバーコードを枠内に合わせてください。';
+    cameraActive = true;
+    scanLocked = false;
+    try {
+      scannerControls = await createScanner().decodeFromVideoDevice(undefined, videoElement, async (result) => {
+        if (!result || scanLocked) return;
+        const scanned = normalizeScannedIsbn(result.getText());
+        if (!scanned) return;
+        scanLocked = true;
+        isbn = scanned;
+        cameraMessage = `読み取りました: ${scanned}`;
+        await stopCameraScan();
+        await lookupIsbn();
+      });
+    } catch (error) {
+      cameraActive = false;
+      cameraMessage = error instanceof Error ? error.message : 'カメラの起動に失敗しました。';
+    }
+  }
+
+  async function stopCameraScan() {
+    scannerControls?.stop();
+    scannerControls = null;
+    cameraActive = false;
+    if (videoElement) videoElement.srcObject = null;
   }
 
   function buildBookPayload(duplicateAction = false) {
@@ -136,7 +207,7 @@
       duplicate = null;
       lookup = null;
       isbn = '';
-      form = { ...form, title: '', author: '', series_name: '', volume_number: '', publisher: '', label: '', category: '', location_detail: '', memo: '' };
+      form = { ...emptyForm, location_id: form.location_id };
       view = 'home';
       await load();
     } catch (error) {
@@ -172,15 +243,40 @@
     locations = await api.locations();
   }
 
+  async function importCsv() {
+    if (!csvFile) {
+      message = 'CSVファイルを選択してください。';
+      return;
+    }
+    loading = true;
+    message = '';
+    try {
+      const result = await api.importCsv(csvFile);
+      message = `CSV取り込み完了: ${result.imported}件登録、${result.skipped}件スキップ`;
+      csvFile = null;
+      await load();
+    } catch (error) {
+      message = error instanceof Error ? error.message : 'CSV取り込みに失敗しました。';
+    } finally {
+      loading = false;
+    }
+  }
+
   onMount(() => {
+    cameraSupported = Boolean(navigator.mediaDevices?.getUserMedia);
+    cameraSecureContext = window.isSecureContext || ['localhost', '127.0.0.1'].includes(window.location.hostname);
     load();
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('/service-worker.js').catch(() => {});
+  });
+
+  onDestroy(() => {
+    void stopCameraScan();
   });
 </script>
 
 <svelte:head>
   <title>Lattice Index</title>
-  <meta name="description" content="個人蔵書を素早く登録・検索するセルフホスト型アプリ" />
+  <meta name="description" content="個人蔵書をISBNで登録、検索、所在地管理できるPWA" />
 </svelte:head>
 
 <main class="shell">
@@ -225,7 +321,7 @@
             <span>{copy.author || '著者未設定'}</span>
             <small>{copy.series_name || ''}{copy.volume_number ? ` ${copy.volume_number}` : ''}</small>
           </div>
-          <div class="location-pill">{copy.location_name || '不明'}</div>
+          <div class="location-pill">{copy.location_name || '未設定'}</div>
         </button>
       {:else}
         <div class="empty">該当する蔵書がありません。</div>
@@ -243,7 +339,21 @@
         <input bind:value={isbn} placeholder="978..." inputmode="numeric" />
         <button on:click={lookupIsbn} disabled={loading}>取得</button>
       </div>
-      <p class="hint">カメラ非対応でも登録できるよう、MVPでは手入力を残しています。</p>
+      <div class="camera-card">
+        <div class="camera-actions">
+          <button on:click={startCameraScan} disabled={loading || cameraActive}><Camera size={18} />カメラで読む</button>
+          {#if cameraActive}
+            <button class="secondary" on:click={stopCameraScan}><X size={18} />停止</button>
+          {/if}
+        </div>
+        <div class:active={cameraActive} class="camera-preview">
+          <video bind:this={videoElement} autoplay muted playsinline></video>
+          {#if !cameraActive}
+            <div class="camera-placeholder"><Camera size={24} /></div>
+          {/if}
+        </div>
+        <p class="hint">{cameraMessage || '携帯ではホーム画面に追加して、HTTPSで開くとカメラ読み取りを利用できます。'}</p>
+      </div>
     </section>
 
     <section class="panel form-grid">
@@ -264,13 +374,13 @@
           {/each}
         </select>
       </label>
-      <label>詳細場所<input bind:value={form.location_detail} placeholder="本棚A 2段目" /></label>
+      <label>詳細場所<input bind:value={form.location_detail} placeholder="本棚 2段目" /></label>
       <label>メモ<textarea bind:value={form.memo} rows="3"></textarea></label>
       {#if duplicate}
         <div class="duplicate">
           <strong>{duplicate.message}</strong>
           {#each duplicate.existing_copies ?? [] as existing}
-            <span>{existing.location_name || '不明'} {existing.location_detail || ''}</span>
+            <span>{existing.location_name || '未設定'} {existing.location_detail || ''}</span>
           {/each}
           <button on:click={() => registerBook(true)}><Check size={18} />別冊として追加</button>
         </div>
@@ -302,6 +412,24 @@
       <a href={`${API_BASE}/api/export/json`}><FileJson size={18} />JSONエクスポート</a>
       <a href={`${API_BASE}/api/backup`} data-method="post" on:click|preventDefault={async () => { await fetch(`${API_BASE}/api/backup`, { method: 'POST' }); message = 'SQLiteバックアップを作成しました。'; }}><Database size={18} />SQLiteバックアップ</a>
     </section>
+
+    <section class="panel">
+      <div class="section-title">
+        <Upload size={20} />
+        <h1>CSV取り込み</h1>
+      </div>
+      <div class="import-row">
+        <input
+          type="file"
+          accept=".csv,text/csv"
+          on:change={(event) => {
+            csvFile = event.currentTarget.files?.[0] ?? null;
+          }}
+        />
+        <button on:click={importCsv} disabled={loading || !csvFile}><Upload size={18} />取り込み</button>
+      </div>
+      <p class="hint">CSVエクスポートと同じ列形式を取り込めます。UTF-8 / Shift_JIS に対応しています。</p>
+    </section>
   {/if}
 </main>
 
@@ -318,7 +446,7 @@
       </div>
     </div>
     <dl>
-      <dt>所在地</dt><dd>{selected.location_name || '不明'} {selected.location_detail || ''}</dd>
+      <dt>所在地</dt><dd>{selected.location_name || '未設定'} {selected.location_detail || ''}</dd>
       <dt>シリーズ</dt><dd>{selected.series_name || '-'} {selected.volume_number || ''}</dd>
       <dt>出版社</dt><dd>{selected.publisher || '-'}</dd>
       <dt>所有状態</dt><dd>{selected.ownership_status}</dd>
@@ -327,7 +455,7 @@
     {#if selected.related_copies?.length}
       <h3>同じ本の別コピー</h3>
       {#each selected.related_copies as related}
-        <div class="related">{related.location_name || '不明'} {related.location_detail || ''}</div>
+        <div class="related">{related.location_name || '未設定'} {related.location_detail || ''}</div>
       {/each}
     {/if}
     <div class="status-actions">
