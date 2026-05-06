@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -17,11 +18,21 @@ from .metadata import lookup_book
 from .schemas import BookCreate, CopyUpdate, LocationCreate, LocationUpdate, LookupRequest
 
 
+def cors_origins() -> list[str]:
+    defaults = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://lattice-index.ruri-sayo.com",
+    ]
+    configured = os.getenv("LATTICE_CORS_ORIGINS", "")
+    return defaults + [origin.strip() for origin in configured.split(",") if origin.strip()]
+
+
 app = FastAPI(title="Lattice Index API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_origin_regex=r"https?://.*(:5173|:4173)?$",
+    allow_origins=cors_origins(),
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:5173|:4173)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

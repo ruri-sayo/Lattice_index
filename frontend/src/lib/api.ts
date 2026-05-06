@@ -1,12 +1,8 @@
 function defaultApiBase() {
-  if (typeof window === 'undefined') return 'http://localhost:8000';
-  if (['5173', '4173'].includes(window.location.port)) {
-    return `${window.location.protocol}//${window.location.hostname}:8000`;
-  }
-  return window.location.origin;
+  return '';
 }
 
-export const API_BASE = import.meta.env.VITE_API_BASE ?? defaultApiBase();
+export const API_BASE = (import.meta.env.VITE_API_BASE ?? defaultApiBase()).replace(/\/$/, '');
 
 export type Location = {
   id: number;
