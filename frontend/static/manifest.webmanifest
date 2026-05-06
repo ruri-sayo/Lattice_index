@@ -1,0 +1,16 @@
+{
+  "name": "Lattice Index",
+  "short_name": "Lattice",
+  "description": "個人蔵書を素早く登録・検索するセルフホスト型アプリ",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f5ef",
+  "theme_color": "#f7f5ef",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
